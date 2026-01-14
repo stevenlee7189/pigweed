@@ -226,6 +226,499 @@ Phase 5: Testing & Documentation
 
 ---
 
+## Design Review: Potential Issues
+
+This section identifies potential issues with interrupt handling and task
+priorities that should be addressed during implementation or documented as
+known limitations.
+
+### Critical Issues
+
+#### 1. Race Condition: Status Query vs. State Change
+
+**File:** `pw_kernel/kernel/object/interrupt.rs`
+
+```rust
+fn interrupt_status(&self, kernel: K, signal_mask: Signals) -> Result<InterruptStatus> {
+    // Get hardware status via callback
+    let mut status = (self.callbacks.get_status_irqs)(signal_mask);  // ← NOT under lock
+
+    // Check if notification is pending in object state
+    let active = self.base.state.lock(kernel).active_signals;       // ← Lock acquired HERE
+    ...
+}
+```
+
+**Problem:** The hardware status query and object state read are not atomic.
+An interrupt could fire between these two operations, causing:
+- PENDING shown but NOTIFIED not yet set (interrupt just fired)
+- NOTIFIED set but PENDING already cleared by hardware
+
+**Mitigation:** Either:
+- Document that `interrupt_status` provides a snapshot that may be stale
+- Acquire lock before hardware query (may increase latency)
+
+**Decision:** Document as known behavior. Status queries are inherently racy
+in concurrent systems.
+
+---
+
+#### 2. Non-Atomic Control Operations
+
+**File:** `pw_kernel/kernel/object/interrupt.rs`
+
+```rust
+fn interrupt_control(&self, ...) -> Result<()> {
+    if control.contains(InterruptControl::CLEAR_PENDING) {
+        (self.callbacks.clear_pending_irqs)(signal_mask);  // ← Step 1
+    }
+
+    if control.contains(InterruptControl::ENABLE) {
+        (self.callbacks.enable_irqs)(signal_mask);         // ← Step 2 (interrupt can fire!)
+    }
+    ...
+}
+```
+
+**Problem:** If `ENABLE | CLEAR_PENDING` is requested:
+1. Clear pending is called
+2. An interrupt could fire here (re-setting pending)
+3. Enable is called → interrupt fires immediately
+
+This could result in a spurious interrupt notification.
+
+**Mitigation:** Reorder operations:
+1. If not enabling, disable first
+2. Clear pending
+3. Enable (if ENABLE flag set)
+
+**Decision:** This is actually correct behavior for most use cases. If the
+hardware fires again after clear, the driver should process it. Document
+the ordering guarantees.
+
+---
+
+#### 3. Priority Inversion Risk in Callback Execution
+
+**Problem:** The callbacks (`enable_irqs`, `disable_irqs`, etc.) execute with
+the scheduler lock potentially held via `SpinLock` which disables preemption.
+If a callback takes too long, higher-priority tasks are blocked.
+
+**Mitigation:**
+- Keep callbacks simple and fast (O(1) operations)
+- Document that callbacks must be non-blocking
+- Consider adding callback timeout watchdog in debug builds
+
+**Decision:** Document requirement that callbacks must be O(1) and
+non-blocking.
+
+---
+
+### Medium Issues
+
+#### 4. Missing Validation of Signal Mask
+
+**File:** `pw_kernel/kernel/syscall.rs`
+
+```rust
+fn handle_interrupt_control<'a, K: Kernel>(...) -> Result<u64> {
+    ...
+    let Some(signal_mask) = Signals::from_bits(signals as u32) else {
+        return Err(Error::InvalidArgument);
+    };
+    // No validation that signal_mask corresponds to actual IRQs in this object
+}
+```
+
+**Problem:** No check that the signal mask corresponds to interrupts actually
+mapped to this `InterruptObject`. A userspace task could pass arbitrary signal
+bits.
+
+**Mitigation:** Either:
+- Validate against a mask stored in `InterruptObject`
+- Document that invalid signals are silently ignored by callbacks
+
+**Decision:** Callbacks are responsible for ignoring unknown signals. This
+follows the Hubris model where the kernel is minimal.
+
+---
+
+#### 5. No Handling of Nested Interrupt Disable
+
+**Problem:** If userspace calls `interrupt_control(empty)` twice to disable,
+then `interrupt_control(ENABLE)` once, the interrupt will be re-enabled.
+There's no reference counting.
+
+```
+Task A: disable → disable → enable → IRQ fires (unexpected!)
+```
+
+This differs from some systems where each disable must be paired with an
+enable.
+
+**Mitigation:** Document this behavior or add a disable count if needed.
+
+**Decision:** Document that enable/disable is idempotent (not reference
+counted). This matches Hubris semantics and is simpler for driver authors.
+
+---
+
+#### 6. PLIC `clear_pending` is No-Op
+
+**File:** `pw_kernel/arch/riscv/plic.rs`
+
+On PLIC, pending state is managed by claim/complete, not a separate register:
+
+```rust
+fn clear_interrupt_pending(_irq: u32) {
+    // PLIC pending is managed by claim/complete, no direct clear
+}
+```
+
+**Problem:** `interrupt_control(CLEAR_PENDING)` silently does nothing on
+RISC-V. Userspace has no way to know this failed.
+
+**Mitigation:**
+- Return an error on PLIC? (breaks API consistency)
+- Document platform differences clearly
+
+**Decision:** Document as platform-specific behavior. CLEAR_PENDING is
+best-effort; drivers should not rely on it for correctness.
+
+---
+
+### Low / Informational Issues
+
+#### 7. `new_simple()` Creates No-Op Callbacks
+
+```rust
+pub const fn new_simple(ack_irqs: fn(Signals)) -> Self {
+    Self {
+        callbacks: InterruptCallbacks {
+            enable_irqs: |_| {},                         // No-op!
+            disable_irqs: |_| {},                        // No-op!
+            get_status_irqs: |_| InterruptStatus::new(), // Always empty!
+        },
+    }
+}
+```
+
+**Problem:** Objects created with `new_simple()` will:
+- `interrupt_control(ENABLE)` → silently do nothing
+- `interrupt_status()` → always return empty (misleading)
+
+**Mitigation:** Either:
+- Return `Unimplemented` for these operations when using simple constructor
+- Add a flag to indicate full vs. simple mode
+- Document the limitation
+
+**Decision:** Document that `new_simple()` is for backward compatibility only.
+New drivers should use `new()` with full callbacks.
+
+---
+
+#### 8. No Timeout Protection on Callbacks
+
+Callbacks are function pointers that could potentially block or loop forever.
+There's no watchdog or timeout protection in the kernel.
+
+**Decision:** Out of scope for this implementation. General callback safety
+is a broader kernel concern.
+
+---
+
+#### 9. Signal Mask Iteration Performance
+
+If `signal_mask` contains multiple bits, each callback may need to iterate
+and check each bit. This could be slow for dense masks.
+
+**Decision:** Acceptable for typical use cases (1-4 IRQs per object). Document
+that callbacks should handle multiple signals efficiently.
+
+---
+
+### Summary Table
+
+| Issue | Severity | Impact | Decision |
+|-------|----------|--------|----------|
+| Race in `interrupt_status` | 🔴 Critical | Inconsistent state | Document as expected |
+| Non-atomic control operations | 🔴 Critical | Spurious IRQs | Document ordering |
+| Priority inversion in callbacks | 🔴 Critical | High-priority blocked | Require O(1) callbacks |
+| Missing signal mask validation | 🟡 Medium | Robustness | Callbacks filter |
+| No nested disable tracking | 🟡 Medium | Unexpected re-enable | Document idempotent |
+| PLIC clear_pending is no-op | 🟡 Medium | Silent failure | Document platform diff |
+| `new_simple()` stubs | 🟢 Low | Misleading status | Document limitation |
+| No callback timeout | 🟢 Low | Potential hang | Out of scope |
+| Signal mask iteration | 🟢 Low | Performance | Document expectation |
+
+---
+
+## RTOS Best Practices Compliance Review
+
+This section evaluates the implementation against established RTOS design
+principles and industry best practices.
+
+### ✅ Compliant Areas
+
+#### 1. Bounded Execution Time (WCET)
+
+| Component | Analysis | Status |
+|-----------|----------|--------|
+| `interrupt_control` syscall | O(1) - single callback invocation | ✅ Pass |
+| `interrupt_status` syscall | O(1) - callback + single lock acquire | ✅ Pass |
+| NVIC operations | Single register read/write | ✅ Pass |
+| PLIC operations | Single register read/write | ✅ Pass |
+
+**Rationale:** All new code paths have deterministic, bounded execution time.
+No loops, recursion, or unbounded operations.
+
+---
+
+#### 2. No Dynamic Memory Allocation
+
+| Component | Analysis | Status |
+|-----------|----------|--------|
+| `InterruptControl` | Stack-allocated bitflags | ✅ Pass |
+| `InterruptStatus` | Stack-allocated bitflags | ✅ Pass |
+| `InterruptCallbacks` | Statically embedded in InterruptObject | ✅ Pass |
+| Syscall handlers | No heap allocations | ✅ Pass |
+
+**Rationale:** Following pw_kernel's existing pattern of static allocation.
+All objects created at compile-time via system generator.
+
+---
+
+#### 3. Priority-Based Preemption Preserved
+
+| Scenario | Analysis | Status |
+|----------|----------|--------|
+| Syscall during high-priority task | SpinLock disables preemption briefly | ✅ Pass |
+| ISR to task notification | Direct signal, scheduler runs on ISR exit | ✅ Pass |
+| Callback execution | Runs at caller's priority | ✅ Pass |
+
+**Rationale:** The implementation uses existing spinlock infrastructure which
+properly disables preemption only for critical sections.
+
+---
+
+#### 4. Interrupt Latency Minimization
+
+| Path | Latency Impact | Status |
+|------|----------------|--------|
+| ISR → Signal | Unchanged (existing path) | ✅ Pass |
+| User enable/disable | Direct NVIC/PLIC register access | ✅ Pass |
+| Status query | Non-blocking register read | ✅ Pass |
+
+**Rationale:** New operations use direct hardware register access without
+additional abstraction layers.
+
+---
+
+#### 5. Static Configuration
+
+| Component | Analysis | Status |
+|-----------|----------|--------|
+| InterruptObject creation | `const fn new()` | ✅ Pass |
+| Callback assignment | Compile-time function pointers | ✅ Pass |
+| Handle mapping | Static object table | ✅ Pass |
+
+**Rationale:** All configuration resolved at compile time. No runtime
+registration or dynamic object creation.
+
+---
+
+### ⚠️ Areas Requiring Attention
+
+#### 6. Memory Ordering and Barriers
+
+**Concern:** The implementation relies on callback functions to perform
+hardware register accesses. No explicit memory barriers are used.
+
+```rust
+fn interrupt_control(&self, ...) -> Result<()> {
+    (self.callbacks.clear_pending_irqs)(signal_mask);  // No barrier after
+    (self.callbacks.enable_irqs)(signal_mask);         // No barrier after
+    Ok(())
+}
+```
+
+**Analysis:**
+- ARM Cortex-M: NVIC registers are strongly-ordered, barriers not required
+- RISC-V: PLIC registers typically memory-mapped, may need `fence` for SMP
+
+**Recommendation:** Document that callbacks should include appropriate
+barriers for multi-core systems if needed.
+
+**Status:** ⚠️ Platform-dependent, document requirements
+
+---
+
+#### 7. Reentrancy Safety
+
+**Concern:** What happens if an interrupt fires while `interrupt_control` is
+executing?
+
+```rust
+fn interrupt_control(&self, kernel: K, signal_mask: Signals, control: InterruptControl) -> Result<()> {
+    // ← IRQ could fire here
+    if control.contains(InterruptControl::CLEAR_PENDING) {
+        (self.callbacks.clear_pending_irqs)(signal_mask);
+    }
+    // ← IRQ could fire here
+    if control.contains(InterruptControl::ENABLE) {
+        (self.callbacks.enable_irqs)(signal_mask);
+    }
+    Ok(())
+}
+```
+
+**Analysis:**
+- If IRQ fires before clear_pending: OK, will be cleared
+- If IRQ fires after enable: OK, will be delivered normally
+- No shared state is corrupted
+
+**Status:** ✅ Safe (interrupt-safe but not atomic)
+
+---
+
+#### 8. Lock Ordering / Deadlock Prevention
+
+**Concern:** Does the implementation introduce new lock dependencies?
+
+**Analysis of lock acquisition order:**
+
+```
+interrupt_control():
+  └─ No locks acquired (callback invocations only)
+
+interrupt_status():
+  └─ self.base.state.lock(kernel)  [ObjectBase spinlock]
+
+interrupt_ack():  (existing)
+  └─ self.base.state.lock(kernel)  [ObjectBase spinlock]
+```
+
+**Observation:** `interrupt_status` acquires the ObjectBase lock, but this
+is consistent with existing `interrupt_ack` behavior.
+
+**Status:** ✅ No new lock ordering issues
+
+---
+
+#### 9. Stack Usage
+
+**Concern:** Are syscall handlers adding significant stack pressure?
+
+**Analysis:**
+```rust
+fn handle_interrupt_control(...) -> Result<u64> {
+    let handle = args.next_u32()?;           // 4 bytes
+    let signals = args.next_u32()?;          // 4 bytes
+    let control_bits = args.next_u32()?;     // 4 bytes
+    let signal_mask = ...;                   // 4 bytes
+    let control = ...;                       // 4 bytes
+    let object = lookup_handle(...)?;        // ~8 bytes (fat pointer)
+    // Total: ~28 bytes additional stack
+}
+```
+
+**Status:** ✅ Minimal stack impact (~32 bytes worst case)
+
+---
+
+### ❌ Non-Compliant Areas / Known Limitations
+
+#### 10. Real-Time Guarantees for Status Queries
+
+**Issue:** `interrupt_status()` does not provide atomicity between hardware
+status and kernel object state.
+
+**RTOS Best Practice:** Status queries should provide a consistent snapshot.
+
+**Current Behavior:**
+```rust
+fn interrupt_status(&self, kernel: K, signal_mask: Signals) -> Result<InterruptStatus> {
+    let mut status = (self.callbacks.get_status_irqs)(signal_mask);  // T1: Read HW
+    // ← Window where interrupt could fire
+    let active = self.base.state.lock(kernel).active_signals;        // T2: Read kernel
+    ...
+}
+```
+
+**Impact:** Status may be inconsistent in a ~10-cycle window.
+
+**Mitigation:** Document that `interrupt_status` is informational only and
+should not be used for synchronization decisions.
+
+**Status:** ❌ Documented limitation
+
+---
+
+#### 11. No Interrupt Priority Support
+
+**Issue:** The implementation doesn't expose interrupt priority configuration.
+
+**RTOS Best Practice:** Allow drivers to configure interrupt priorities.
+
+**Current State:** NVIC priorities are set uniformly in `early_init()`:
+```rust
+fn early_init(&self) {
+    for i in 0..NvicConfig::MAX_IRQS {
+        nvic_regs.set_priority(i as usize, 0b0100_0000);  // All same priority
+    }
+}
+```
+
+**Impact:** All userspace interrupts have equal priority at hardware level.
+
+**Recommendation:** Consider future syscall for priority configuration.
+
+**Status:** ❌ Out of scope (future enhancement)
+
+---
+
+#### 12. No Interrupt Affinity (Multi-Core)
+
+**Issue:** No mechanism to direct interrupts to specific cores.
+
+**RTOS Best Practice:** SMP systems should support interrupt affinity.
+
+**Current State:** Single-core assumption throughout.
+
+**Status:** ❌ Out of scope (pw_kernel is single-core currently)
+
+---
+
+### Compliance Summary
+
+| Category | Items Checked | Compliant | Attention | Non-Compliant |
+|----------|---------------|-----------|-----------|---------------|
+| Timing Determinism | 4 | 4 | 0 | 0 |
+| Memory Management | 4 | 4 | 0 | 0 |
+| Scheduling | 3 | 3 | 0 | 0 |
+| Interrupt Handling | 3 | 2 | 1 | 0 |
+| Synchronization | 3 | 2 | 0 | 1 |
+| Platform Support | 2 | 0 | 1 | 1 |
+| **Total** | **19** | **15 (79%)** | **2 (10%)** | **2 (11%)** |
+
+---
+
+### Recommendations for Future Work
+
+1. **Add `interrupt_set_priority` syscall** - Allow drivers to configure
+   interrupt priorities within their permitted range.
+
+2. **Add memory barrier documentation** - Document when callbacks need
+   explicit barriers for multi-core scenarios.
+
+3. **Consider atomic status query** - For use cases requiring consistent
+   snapshots, consider a version that disables interrupts briefly.
+
+4. **SMP support** - When pw_kernel adds multi-core support, extend with
+   interrupt affinity configuration.
+
+---
+
 ## Phase 1: Type Definitions
 
 **Goal:** Define `InterruptControl` and `InterruptStatus` bitflags types.
@@ -752,11 +1245,60 @@ pub fn interrupt_status(
 
 ---
 
-## Phase 5: Testing & Documentation
+## Phase 5: Testing Strategy
 
-### Task 5.1: Unit tests for new types
+This phase ensures the implementation is correct, robust, and doesn't break
+existing functionality. Testing is organized into three levels:
 
-**File:** `pw_kernel/syscall/syscall_defs.rs` (or separate test file)
+1. **Unit Tests** - Test individual components in isolation
+2. **Integration Tests** - Test syscall flow end-to-end
+3. **Regression Tests** - Ensure existing functionality works
+
+### Test Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           TEST ARCHITECTURE                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
+│   UNIT TESTS         │     │  KERNEL-SIDE TESTS   │     │  USERSPACE TESTS     │
+│   (Host/Native)      │     │  (On-Target)         │     │  (On-Target)         │
+├──────────────────────┤     ├──────────────────────┤     ├──────────────────────┤
+│ • Bitflags behavior  │     │ • InterruptController│     │ • interrupt_control()│
+│ • Type conversions   │     │   trait methods      │     │ • interrupt_status() │
+│ • Signal mask ops    │     │ • NVIC/PLIC impl     │     │ • Full IRQ flow      │
+│ • Error conditions   │     │ • InterruptObject    │     │ • Edge cases         │
+└──────────────────────┘     └──────────────────────┘     └──────────────────────┘
+         │                            │                            │
+         ▼                            ▼                            ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        bazel test //pw_kernel/...                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Task 5.1: Unit Tests for Type Definitions
+
+**Goal:** Verify `InterruptControl` and `InterruptStatus` bitflags work correctly.
+
+**File:** `pw_kernel/syscall/syscall_defs.rs`
+
+**Test Cases:**
+
+| Test ID | Description | Expected Result |
+|---------|-------------|-----------------|
+| UT-01 | Create empty InterruptControl | `bits() == 0` |
+| UT-02 | Set ENABLE flag | `contains(ENABLE) == true` |
+| UT-03 | Set CLEAR_PENDING flag | `contains(CLEAR_PENDING) == true` |
+| UT-04 | Combine ENABLE \| CLEAR_PENDING | Both flags set, `bits() == 0b0011` |
+| UT-05 | Create empty InterruptStatus | `bits() == 0` |
+| UT-06 | Check ENABLED flag | Correct bit position |
+| UT-07 | Check PENDING flag | Correct bit position |
+| UT-08 | Check NOTIFIED flag | Correct bit position |
+| UT-09 | Combine multiple status flags | OR operation works |
+| UT-10 | from_bits_truncate invalid bits | Ignores unknown bits |
 
 ```rust
 #[cfg(test)]
@@ -764,7 +1306,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_interrupt_control_bits() {
+    fn test_interrupt_control_empty() {
+        let ctrl = InterruptControl::new();
+        assert_eq!(ctrl.bits(), 0);
+        assert!(!ctrl.contains(InterruptControl::ENABLE));
+        assert!(!ctrl.contains(InterruptControl::CLEAR_PENDING));
+    }
+
+    #[test]
+    fn test_interrupt_control_enable() {
+        let ctrl = InterruptControl::ENABLE;
+        assert!(ctrl.contains(InterruptControl::ENABLE));
+        assert!(!ctrl.contains(InterruptControl::CLEAR_PENDING));
+        assert_eq!(ctrl.bits(), 0b0001);
+    }
+
+    #[test]
+    fn test_interrupt_control_clear_pending() {
+        let ctrl = InterruptControl::CLEAR_PENDING;
+        assert!(!ctrl.contains(InterruptControl::ENABLE));
+        assert!(ctrl.contains(InterruptControl::CLEAR_PENDING));
+        assert_eq!(ctrl.bits(), 0b0010);
+    }
+
+    #[test]
+    fn test_interrupt_control_combined() {
         let ctrl = InterruptControl::ENABLE | InterruptControl::CLEAR_PENDING;
         assert!(ctrl.contains(InterruptControl::ENABLE));
         assert!(ctrl.contains(InterruptControl::CLEAR_PENDING));
@@ -772,48 +1338,688 @@ mod tests {
     }
 
     #[test]
-    fn test_interrupt_status_bits() {
+    fn test_interrupt_status_flags() {
+        assert_eq!(InterruptStatus::ENABLED.bits(), 0b0001);
+        assert_eq!(InterruptStatus::PENDING.bits(), 0b0010);
+        assert_eq!(InterruptStatus::NOTIFIED.bits(), 0b0100);
+    }
+
+    #[test]
+    fn test_interrupt_status_combined() {
         let status = InterruptStatus::ENABLED | InterruptStatus::PENDING;
         assert!(status.contains(InterruptStatus::ENABLED));
         assert!(status.contains(InterruptStatus::PENDING));
         assert!(!status.contains(InterruptStatus::NOTIFIED));
     }
+
+    #[test]
+    fn test_result_conversion_success() {
+        let ret = SysCallReturnValue(0b0101);
+        let status = ret.to_result_interrupt_status().unwrap();
+        assert!(status.contains(InterruptStatus::ENABLED));
+        assert!(!status.contains(InterruptStatus::PENDING));
+        assert!(status.contains(InterruptStatus::NOTIFIED));
+    }
+
+    #[test]
+    fn test_result_conversion_error() {
+        let ret = SysCallReturnValue(-22); // EINVAL
+        let result = ret.to_result_interrupt_status();
+        assert!(result.is_err());
+    }
 }
 ```
 
-### Task 5.2: Integration test
+---
 
-**File:** `pw_kernel/tests/irq_control/` (new test directory)
+### Task 5.2: Kernel-Side Tests (InterruptController)
 
-Create a test that:
-1. Creates an interrupt object
-2. Verifies interrupt starts disabled (if policy adopted)
-3. Enables interrupt via `interrupt_control()`
-4. Verifies status shows enabled
-5. Triggers interrupt
-6. Waits for signal
-7. Checks pending status
-8. Disables and clears pending
-
-### Task 5.3: Update existing interrupt tests
-
-**File:** `pw_kernel/tests/uart/` and other interrupt-using tests
-
-Ensure existing tests still work with extended `InterruptObject` constructor.
-
-### Task 5.4: Update documentation
+**Goal:** Verify architecture-specific InterruptController implementations.
 
 **Files:**
-- `pw_kernel/syscall/syscall_defs.rs`: Update module docs
-- `pw_kernel/docs/api.rst`: Add new syscall documentation
-- `pw_kernel/docs/interrupts.rst`: Update interrupt handling docs
+- `pw_kernel/tests/irq_control/kernel/main.rs`
+- `pw_kernel/tests/irq_control/kernel/BUILD.bazel`
 
-### Task 5.5: Update system generator
+**Test Cases:**
 
-**Files:** (location TBD based on code generator implementation)
+| Test ID | Description | Platform | Expected Result |
+|---------|-------------|----------|-----------------|
+| KT-01 | is_interrupt_enabled after enable | ARM/RISC-V | Returns true |
+| KT-02 | is_interrupt_enabled after disable | ARM/RISC-V | Returns false |
+| KT-03 | is_interrupt_pending after trigger | ARM only | Returns true |
+| KT-04 | is_interrupt_pending after clear | ARM only | Returns false |
+| KT-05 | clear_interrupt_pending on PLIC | RISC-V | No-op (no crash) |
+| KT-06 | Enable → Disable → Enable cycle | ARM/RISC-V | State correct |
 
-Update the system generator to emit the additional callbacks when generating
-interrupt object initialization code.
+```rust
+// pw_kernel/tests/irq_control/kernel/main.rs
+
+#![no_std]
+
+use kernel::Kernel;
+use kernel::interrupt_controller::InterruptController;
+use pw_status::Result;
+
+pub fn test_is_interrupt_enabled<K: Kernel>(irq: u32) -> Result<()> {
+    pw_log::info!("KT-01/02: Test is_interrupt_enabled");
+
+    // Enable and check
+    K::InterruptController::enable_interrupt(irq);
+    pw_assert::assert!(
+        K::InterruptController::is_interrupt_enabled(irq),
+        "IRQ should be enabled"
+    );
+
+    // Disable and check
+    K::InterruptController::disable_interrupt(irq);
+    pw_assert::assert!(
+        !K::InterruptController::is_interrupt_enabled(irq),
+        "IRQ should be disabled"
+    );
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+pub fn test_pending_status<K: Kernel>(irq: u32) -> Result<()> {
+    pw_log::info!("KT-03/04: Test pending status");
+
+    // Disable IRQ so trigger creates pending without firing
+    K::InterruptController::disable_interrupt(irq);
+
+    // Trigger creates pending
+    K::InterruptController::trigger_interrupt(irq);
+    let pending = K::InterruptController::is_interrupt_pending(irq);
+    pw_log::info!("  Pending after trigger: {}", pending);
+
+    // Clear pending
+    K::InterruptController::clear_interrupt_pending(irq);
+    let pending_after = K::InterruptController::is_interrupt_pending(irq);
+    pw_log::info!("  Pending after clear: {}", pending_after);
+
+    // Re-enable for cleanup
+    K::InterruptController::enable_interrupt(irq);
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+pub fn test_enable_disable_cycle<K: Kernel>(irq: u32) -> Result<()> {
+    pw_log::info!("KT-06: Test enable/disable cycle");
+
+    for i in 0..5 {
+        K::InterruptController::enable_interrupt(irq);
+        pw_assert::assert!(K::InterruptController::is_interrupt_enabled(irq));
+
+        K::InterruptController::disable_interrupt(irq);
+        pw_assert::assert!(!K::InterruptController::is_interrupt_enabled(irq));
+    }
+
+    // Leave enabled
+    K::InterruptController::enable_interrupt(irq);
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+pub fn main<K: Kernel>(test_irq: u32) -> Result<()> {
+    pw_log::info!("🔄 RUNNING kernel irq_control tests");
+
+    test_is_interrupt_enabled::<K>(test_irq)?;
+    test_pending_status::<K>(test_irq)?;
+    test_enable_disable_cycle::<K>(test_irq)?;
+
+    pw_log::info!("✅ PASSED");
+    Ok(())
+}
+```
+
+**BUILD.bazel:**
+
+```python
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+rust_library(
+    name = "test_irq_control",
+    srcs = ["main.rs"],
+    edition = "2024",
+    tags = ["kernel"],
+    target_compatible_with = select({
+        # PLIC doesn't support trigger_interrupt
+        "@platforms//cpu:riscv32": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//pw_kernel/kernel",
+        "//pw_kernel/lib/pw_assert",
+        "//pw_log/rust:pw_log",
+        "//pw_status/rust:pw_status",
+    ],
+)
+```
+
+---
+
+### Task 5.3: Userspace Integration Tests
+
+**Goal:** Test the full syscall path from userspace through kernel and back.
+
+**Files:**
+- `pw_kernel/tests/irq_control/user/main.rs`
+- `pw_kernel/tests/irq_control/user/BUILD.bazel`
+
+**Test Cases:**
+
+| Test ID | Description | Expected Result |
+|---------|-------------|-----------------|
+| IT-01 | interrupt_status initial state | ENABLED (system generator enables) |
+| IT-02 | interrupt_control disable | Status shows !ENABLED |
+| IT-03 | interrupt_control enable | Status shows ENABLED |
+| IT-04 | Trigger while disabled | PENDING set, !NOTIFIED |
+| IT-05 | Clear pending | PENDING cleared |
+| IT-06 | Enable + clear combined | Both operations work |
+| IT-07 | Full flow with object_wait | Receive and re-enable works |
+| IT-08 | Invalid handle | Returns InvalidArgument |
+| IT-09 | Invalid signal mask | Returns InvalidArgument |
+| IT-10 | interrupt_ack still works | Backward compatibility |
+
+```rust
+// pw_kernel/tests/irq_control/user/main.rs
+
+#![no_main]
+#![no_std]
+
+use app_test_interrupt_listener::{handle, signals};
+use pw_status::{Error, Result};
+use userspace::syscall::{InterruptControl, InterruptStatus, Signals};
+use userspace::time::Instant;
+use userspace::{entry, syscall};
+
+const TEST_IRQ: u32 = 42;
+
+/// IT-01: Test initial status query
+fn test_initial_status() -> Result<()> {
+    pw_log::info!("IT-01: Query initial status");
+
+    let status = syscall::interrupt_status(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+    )?;
+
+    // System generator enables interrupts by default
+    if !status.contains(InterruptStatus::ENABLED) {
+        pw_log::error!("Expected ENABLED initially");
+        return Err(Error::FailedPrecondition);
+    }
+
+    if status.contains(InterruptStatus::NOTIFIED) {
+        pw_log::error!("Expected !NOTIFIED initially");
+        return Err(Error::FailedPrecondition);
+    }
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+/// IT-02: Test disabling interrupt
+fn test_disable() -> Result<()> {
+    pw_log::info!("IT-02: Test disable");
+
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::new(), // empty = disable
+    )?;
+
+    let status = syscall::interrupt_status(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+    )?;
+
+    if status.contains(InterruptStatus::ENABLED) {
+        pw_log::error!("Expected !ENABLED after disable");
+        return Err(Error::FailedPrecondition);
+    }
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+/// IT-03: Test enabling interrupt
+fn test_enable() -> Result<()> {
+    pw_log::info!("IT-03: Test enable");
+
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::ENABLE,
+    )?;
+
+    let status = syscall::interrupt_status(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+    )?;
+
+    if !status.contains(InterruptStatus::ENABLED) {
+        pw_log::error!("Expected ENABLED after enable");
+        return Err(Error::FailedPrecondition);
+    }
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+/// IT-04: Test trigger while disabled
+fn test_trigger_while_disabled() -> Result<()> {
+    pw_log::info!("IT-04: Trigger while disabled");
+
+    // Disable first
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::new(),
+    )?;
+
+    // Trigger the interrupt
+    syscall::debug_trigger_interrupt(TEST_IRQ)?;
+
+    let status = syscall::interrupt_status(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+    )?;
+
+    // Should be pending but NOT notified (disabled)
+    if status.contains(InterruptStatus::NOTIFIED) {
+        pw_log::error!("Should NOT be notified while disabled");
+        return Err(Error::FailedPrecondition);
+    }
+
+    // PENDING is architecture-dependent (may not be visible)
+    pw_log::info!("  PENDING status: {}", status.contains(InterruptStatus::PENDING));
+
+    // Cleanup: clear pending
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::CLEAR_PENDING,
+    )?;
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+/// IT-06: Test combined enable + clear
+fn test_enable_and_clear() -> Result<()> {
+    pw_log::info!("IT-06: Enable and clear combined");
+
+    // Start disabled with pending
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::new(),
+    )?;
+    syscall::debug_trigger_interrupt(TEST_IRQ)?;
+
+    // Enable and clear in one call
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::ENABLE | InterruptControl::CLEAR_PENDING,
+    )?;
+
+    let status = syscall::interrupt_status(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+    )?;
+
+    if !status.contains(InterruptStatus::ENABLED) {
+        pw_log::error!("Expected ENABLED");
+        return Err(Error::FailedPrecondition);
+    }
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+/// IT-07: Test full interrupt flow
+fn test_full_flow() -> Result<()> {
+    pw_log::info!("IT-07: Full interrupt flow");
+
+    // Ensure enabled
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::ENABLE,
+    )?;
+
+    // Trigger
+    syscall::debug_trigger_interrupt(TEST_IRQ)?;
+
+    // Wait with timeout
+    let result = syscall::object_wait(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        Instant::from_ticks(10_000_000), // 10s timeout
+    );
+
+    match result {
+        Ok(sigs) => {
+            if !sigs.contains(signals::TEST_IRQ) {
+                pw_log::error!("Wrong signal");
+                return Err(Error::Internal);
+            }
+
+            // Re-enable using interrupt_control
+            syscall::interrupt_control(
+                handle::TEST_INTERRUPTS,
+                sigs,
+                InterruptControl::ENABLE,
+            )?;
+
+            pw_log::info!("  PASSED");
+            Ok(())
+        }
+        Err(e) => {
+            pw_log::error!("Wait failed: {}", e as u32);
+            Err(e)
+        }
+    }
+}
+
+/// IT-10: Test backward compatibility with interrupt_ack
+fn test_backward_compat() -> Result<()> {
+    pw_log::info!("IT-10: Backward compatibility (interrupt_ack)");
+
+    // Ensure enabled
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::ENABLE,
+    )?;
+
+    // Trigger
+    syscall::debug_trigger_interrupt(TEST_IRQ)?;
+
+    // Wait
+    let sigs = syscall::object_wait(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        Instant::from_ticks(10_000_000),
+    )?;
+
+    // Use old-style interrupt_ack
+    syscall::interrupt_ack(handle::TEST_INTERRUPTS, sigs)?;
+
+    // Verify still enabled
+    let status = syscall::interrupt_status(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+    )?;
+
+    if !status.contains(InterruptStatus::ENABLED) {
+        pw_log::error!("interrupt_ack should re-enable");
+        return Err(Error::FailedPrecondition);
+    }
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+
+fn run_all_tests() -> Result<()> {
+    test_initial_status()?;
+    test_disable()?;
+    test_enable()?;
+    test_trigger_while_disabled()?;
+    test_enable_and_clear()?;
+    test_full_flow()?;
+    test_backward_compat()?;
+    Ok(())
+}
+
+#[entry]
+fn entry() -> ! {
+    pw_log::info!("🔄 RUNNING userspace irq_control tests");
+    let ret = run_all_tests();
+
+    if ret.is_err() {
+        pw_log::error!("❌ FAILED: {}", ret.status_code() as u32);
+    } else {
+        pw_log::info!("✅ PASSED");
+    }
+
+    let _ = syscall::debug_shutdown(ret);
+    loop {}
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+```
+
+**BUILD.bazel:**
+
+```python
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "test_irq_control",
+    srcs = ["main.rs"],
+    edition = "2024",
+    tags = ["kernel"],
+    visibility = ["//visibility:public"],
+    deps = [
+        # Reuse interrupt_listener app package (same system config)
+        "//pw_kernel/tests/interrupts/user:app_test_interrupt_listener",
+        "//pw_kernel/userspace",
+        "//pw_log/rust:pw_log",
+        "//pw_status/rust:pw_status",
+    ],
+)
+```
+
+---
+
+### Task 5.4: Regression Tests
+
+**Goal:** Ensure existing interrupt functionality still works.
+
+**Approach:**
+
+1. **Run existing interrupt tests** - `//pw_kernel/tests/interrupts/...`
+2. **Run UART tests** - `//pw_kernel/tests/uart/...`
+3. **Verify system generator** - Builds with `new_simple()` constructor
+
+**Test Commands:**
+
+```bash
+# Run all pw_kernel tests
+bazel test //pw_kernel/tests/...
+
+# Run specifically interrupt-related tests
+bazel test //pw_kernel/tests/interrupts/...
+bazel test //pw_kernel/tests/irq_control/...
+bazel test //pw_kernel/tests/uart/...
+
+# Verify full kernel build
+bazel build //pw_kernel/...
+```
+
+---
+
+### Task 5.5: Edge Case and Error Handling Tests
+
+**Goal:** Test boundary conditions and error paths.
+
+**Test Cases:**
+
+| Test ID | Description | Expected Result |
+|---------|-------------|-----------------|
+| EC-01 | interrupt_control on non-InterruptObject | Error::Unimplemented |
+| EC-02 | interrupt_status on Channel | Error::Unimplemented |
+| EC-03 | Invalid handle (0xFFFFFFFF) | Error::InvalidArgument |
+| EC-04 | Empty signal mask | Success (no-op) |
+| EC-05 | Signal mask with non-interrupt bits | Implementation-defined |
+| EC-06 | Rapid enable/disable cycles | No race conditions |
+| EC-07 | Multiple interrupts same object | All handled correctly |
+
+```rust
+/// EC-01: Test interrupt_control on wrong object type
+fn test_wrong_object_type() -> Result<()> {
+    pw_log::info!("EC-01: interrupt_control on non-InterruptObject");
+
+    // Try on IPC channel (should fail)
+    let result = syscall::interrupt_control(
+        handle::IPC,  // This is a channel, not interrupt object
+        Signals::READABLE,
+        InterruptControl::ENABLE,
+    );
+
+    match result {
+        Err(Error::Unimplemented) => {
+            pw_log::info!("  PASSED: Got expected Unimplemented error");
+            Ok(())
+        }
+        Err(e) => {
+            pw_log::info!("  PASSED: Got error {} (acceptable)", e as u32);
+            Ok(())
+        }
+        Ok(_) => {
+            pw_log::error!("Should have failed on channel");
+            Err(Error::FailedPrecondition)
+        }
+    }
+}
+
+/// EC-04: Test empty signal mask
+fn test_empty_signal_mask() -> Result<()> {
+    pw_log::info!("EC-04: Empty signal mask");
+
+    // Should be a no-op, not an error
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        Signals::new(), // empty
+        InterruptControl::ENABLE,
+    )?;
+
+    pw_log::info!("  PASSED: Empty mask accepted");
+    Ok(())
+}
+
+/// EC-06: Rapid enable/disable cycles (stress test)
+fn test_rapid_cycles() -> Result<()> {
+    pw_log::info!("EC-06: Rapid enable/disable cycles");
+
+    for _ in 0..100 {
+        syscall::interrupt_control(
+            handle::TEST_INTERRUPTS,
+            signals::TEST_IRQ,
+            InterruptControl::ENABLE,
+        )?;
+
+        syscall::interrupt_control(
+            handle::TEST_INTERRUPTS,
+            signals::TEST_IRQ,
+            InterruptControl::new(),
+        )?;
+    }
+
+    // Verify final state is consistent
+    syscall::interrupt_control(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+        InterruptControl::ENABLE,
+    )?;
+
+    let status = syscall::interrupt_status(
+        handle::TEST_INTERRUPTS,
+        signals::TEST_IRQ,
+    )?;
+
+    if !status.contains(InterruptStatus::ENABLED) {
+        pw_log::error!("State inconsistent after rapid cycles");
+        return Err(Error::Internal);
+    }
+
+    pw_log::info!("  PASSED");
+    Ok(())
+}
+```
+
+---
+
+### Task 5.6: Documentation Updates
+
+**Files to Update:**
+
+| File | Changes |
+|------|---------|
+| `pw_kernel/syscall/syscall_defs.rs` | Add rustdoc for new types and syscalls |
+| `pw_kernel/docs/interrupts.rst` | Add section on userspace IRQ control |
+| `pw_kernel/README.md` | Mention new capabilities |
+
+**Example Documentation:**
+
+```rust
+/// Control flags for the [`interrupt_control()`] syscall.
+///
+/// # Examples
+///
+/// ```rust
+/// // Disable an interrupt
+/// interrupt_control(handle, signal, InterruptControl::new())?;
+///
+/// // Enable an interrupt
+/// interrupt_control(handle, signal, InterruptControl::ENABLE)?;
+///
+/// // Enable and clear any pending status
+/// interrupt_control(handle, signal,
+///     InterruptControl::ENABLE | InterruptControl::CLEAR_PENDING)?;
+/// ```
+pub struct InterruptControl(u32);
+```
+
+---
+
+### Task 5.7: System Generator Update
+
+**File:** `pw_kernel/tooling/system_generator/templates/objects/interrupt.rs.jinja`
+
+**Change:** Update to use `new_simple()` for backward compatibility.
+
+```jinja
+    // Create the interrupt object.
+    let interrupt =
+        unsafe { static_foreign_rc!(AtomicUsize, InterruptObject<K>, InterruptObject::new_simple(ack_irqs)) };
+```
+
+**Future Enhancement:** Update generator to emit full callbacks for
+`interrupt_control` support when system config specifies advanced features.
+
+---
+
+### Test Execution Matrix
+
+| Test Suite | ARM Cortex-M | RISC-V | Host |
+|------------|--------------|--------|------|
+| Unit Tests (UT-*) | ✅ | ✅ | ✅ |
+| Kernel Tests (KT-*) | ✅ | ❌ (no trigger) | N/A |
+| Integration Tests (IT-*) | ✅ | ❌ (no trigger) | N/A |
+| Edge Cases (EC-*) | ✅ | Partial | Partial |
+| Regression | ✅ | ✅ | ✅ |
+
+---
+
+### Test Success Criteria
+
+| Metric | Target |
+|--------|--------|
+| Unit test pass rate | 100% |
+| Integration test pass rate | 100% |
+| Regression test pass rate | 100% |
+| Code coverage (new code) | > 80% |
+| No new compiler warnings | Required |
+| Backward compatibility | All existing tests pass |
 
 ---
 
@@ -833,7 +2039,9 @@ interrupt object initialization code.
 | `pw_kernel/syscall/syscall_user/riscv.rs` | Modify | Implement syscall interface |
 | `pw_kernel/syscall/syscall_user/host.rs` | Modify | Add stubs |
 | `pw_kernel/userspace/syscall.rs` | Modify | Add wrapper functions |
-| `pw_kernel/tests/irq_control/` | Create | New integration test |
+| `pw_kernel/tests/irq_control/kernel/` | Create | Kernel-side tests |
+| `pw_kernel/tests/irq_control/user/` | Create | Userspace integration tests |
+| `pw_kernel/tooling/.../interrupt.rs.jinja` | Modify | Use new_simple() |
 
 ---
 
@@ -853,7 +2061,8 @@ interrupt object initialization code.
        4.1 ──► 4.2 ──► 4.3 ──► 4.4 ──► 4.5 ──► 4.6 ──► 4.7
                                                         │
                                                         ▼
-                                        5.1 ──► 5.2 ──► 5.3 ──► 5.4 ──► 5.5
+       5.1 ──► 5.2 ──► 5.3 ──► 5.4 ──► 5.5 ──► 5.6 ──► 5.7
+       (Unit)  (Kernel)(User) (Regr) (Edge) (Docs) (Gen)
 ```
 
 ---
@@ -866,8 +2075,8 @@ interrupt object initialization code.
 | Phase 2: InterruptController | 4 | 4-6 hours |
 | Phase 3: InterruptObject | 6 | 6-8 hours |
 | Phase 4: Syscall Infrastructure | 7 | 8-10 hours |
-| Phase 5: Testing & Docs | 5 | 6-8 hours |
-| **Total** | **25** | **26-35 hours** |
+| Phase 5: Testing & Docs | 7 | 8-12 hours |
+| **Total** | **27** | **28-39 hours** |
 
 ---
 

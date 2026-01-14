@@ -32,7 +32,7 @@ mod interrupt;
 
 pub use buffer::SyscallBuffer;
 pub use channel::{ChannelHandlerObject, ChannelInitiatorObject};
-pub use interrupt::InterruptObject;
+pub use interrupt::{InterruptCallbacks, InterruptObject};
 
 /// Trait that all kernel objects implement.
 ///
@@ -75,6 +75,31 @@ pub trait KernelObject<K: Kernel>: Any + Send + Sync {
 
     #[allow(unused_variables)]
     fn interrupt_ack(&self, kernel: K, signal_mask: Signals) -> Result<()> {
+        Err(Error::Unimplemented)
+    }
+
+    /// Control interrupt enable/disable and clear pending status.
+    ///
+    /// Only valid for InterruptObject. Other objects return Unimplemented.
+    #[allow(unused_variables)]
+    fn interrupt_control(
+        &self,
+        kernel: K,
+        signal_mask: Signals,
+        control: syscall_defs::InterruptControl,
+    ) -> Result<()> {
+        Err(Error::Unimplemented)
+    }
+
+    /// Query the status of interrupts.
+    ///
+    /// Only valid for InterruptObject. Other objects return Unimplemented.
+    #[allow(unused_variables)]
+    fn interrupt_status(
+        &self,
+        kernel: K,
+        signal_mask: Signals,
+    ) -> Result<syscall_defs::InterruptStatus> {
         Err(Error::Unimplemented)
     }
 }

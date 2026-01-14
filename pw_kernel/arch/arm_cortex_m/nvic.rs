@@ -146,4 +146,34 @@ impl InterruptController for Nvic {
         let mut nvic_regs = regs::Nvic {};
         nvic_regs.set_pending(irq as usize);
     }
+
+    fn is_interrupt_pending(irq: u32) -> bool {
+        let nvic_regs = regs::Nvic {};
+        let pending = nvic_regs.is_pending(irq as usize);
+        debug_if!(
+            LOG_INTERRUPTS,
+            "Is interrupt {} pending: {}",
+            irq as u32,
+            pending as u32
+        );
+        pending
+    }
+
+    fn clear_interrupt_pending(irq: u32) {
+        debug_if!(LOG_INTERRUPTS, "Clear pending interrupt {}", irq as u32);
+        let mut nvic_regs = regs::Nvic {};
+        nvic_regs.clear_pending(irq as usize);
+    }
+
+    fn is_interrupt_enabled(irq: u32) -> bool {
+        let nvic_regs = regs::Nvic {};
+        let enabled = nvic_regs.is_enabled(irq as usize);
+        debug_if!(
+            LOG_INTERRUPTS,
+            "Is interrupt {} enabled: {}",
+            irq as u32,
+            enabled as u32
+        );
+        enabled
+    }
 }

@@ -67,6 +67,21 @@ pub trait InterruptController {
     /// Trigger an interrupt by IRQ.  This may not be supported
     /// on all interrupt controllers.
     fn trigger_interrupt(irq: u32);
+
+    /// Check if a specific interrupt is pending in hardware.
+    ///
+    /// Returns `true` if the interrupt has been asserted but not yet serviced.
+    fn is_interrupt_pending(irq: u32) -> bool;
+
+    /// Clear the pending status of a specific interrupt.
+    ///
+    /// This clears the hardware pending bit without enabling/disabling the interrupt.
+    fn clear_interrupt_pending(irq: u32);
+
+    /// Check if a specific interrupt is currently enabled.
+    ///
+    /// Returns `true` if the interrupt is unmasked at the hardware level.
+    fn is_interrupt_enabled(irq: u32) -> bool;
 }
 
 pub fn handler_done<K: Kernel>(kernel: K, preempt_guard: PreemptDisableGuard<K>) {

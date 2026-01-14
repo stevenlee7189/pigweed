@@ -282,6 +282,39 @@ impl InterruptController for Plic {
     fn trigger_interrupt(_irq: u32) {
         pw_assert::panic!("trigger_interrupt not supported on the PLIC");
     }
+
+    fn is_interrupt_pending(irq: u32) -> bool {
+        let pending = get_interrupt_pending(irq);
+        debug_if!(
+            LOG_INTERRUPTS,
+            "Is interrupt {} pending: {}",
+            irq as u32,
+            pending as u32
+        );
+        pending
+    }
+
+    fn clear_interrupt_pending(_irq: u32) {
+        // PLIC pending bits are read-only and cleared by claiming/completing.
+        // This is a no-op for the PLIC as pending status is managed by the
+        // claim/complete mechanism.
+        debug_if!(
+            LOG_INTERRUPTS,
+            "Clear pending interrupt {} (no-op for PLIC)",
+            _irq as u32
+        );
+    }
+
+    fn is_interrupt_enabled(irq: u32) -> bool {
+        let enabled = get_interrupt_enabled(irq);
+        debug_if!(
+            LOG_INTERRUPTS,
+            "Is interrupt {} enabled: {}",
+            irq as u32,
+            enabled as u32
+        );
+        enabled
+    }
 }
 
 fn set_interrupt_enable(irq: u32, enable: bool) {
@@ -305,4 +338,22 @@ fn set_global_priority(priority: u32) {
 fn set_interrupt_priority(irq: u32, priority: u32) {
     let mut ipr = Ipr {};
     ipr.write(&CONTEXT_0, irq, IprValue(priority));
+}
+
+fn get_interrupt_enabled(irq: u32) -> bool {
+    let mut ier: Ier = Ier {};
+    let enabled_sources = ier.read(&CONTEXT_0, irq).0;
+    let bitmask = 1 << (irq % 32);
+    (enabled_sources & bitmask) != 0
+}
+
+fn get_interrupt_pending(irq: u32) -> bool {
+    // PLIC Interrupt Pending registers are at offset 0x1000
+    // Each register covers 32 interrupt sources
+    let reg_offset = (irq / 32) as usize;
+    let bit_index = irq % 32;
+    let pending_reg_addr = PlicConfig::PLIC_BASE_ADDRESS + 0x1000 + (reg_offset * 4);
+    let pending_reg = ptr::with_exposed_provenance::<u32>(pending_reg_addr);
+    let pending_bits = unsafe { pending_reg.read_volatile() };
+    (pending_bits & (1 << bit_index)) != 0
 }

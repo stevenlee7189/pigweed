@@ -12,7 +12,7 @@
 // License for the specific language governing permissions and limitations under
 // the License.
 use pw_status::Result;
-use syscall_defs::{Signals, SysCallInterface};
+use syscall_defs::{InterruptControl, InterruptStatus, Signals, SysCallInterface};
 
 pub struct SysCall {}
 
@@ -51,6 +51,20 @@ impl SysCallInterface for SysCall {
 
     #[inline(always)]
     fn interrupt_ack(_handle: u32, _signal_mask: Signals) -> Result<()> {
+        Err(pw_status::Error::Unimplemented)
+    }
+
+    #[inline(always)]
+    fn interrupt_control(
+        _handle: u32,
+        _signal_mask: Signals,
+        _control: InterruptControl,
+    ) -> Result<()> {
+        Err(pw_status::Error::Unimplemented)
+    }
+
+    #[inline(always)]
+    fn interrupt_status(_handle: u32, _signal_mask: Signals) -> Result<InterruptStatus> {
         Err(pw_status::Error::Unimplemented)
     }
 

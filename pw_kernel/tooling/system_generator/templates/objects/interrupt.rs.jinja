@@ -14,39 +14,82 @@
 {
     use kernel::__private::foreign_box::{static_foreign_rc, upcast_foreign_rc};
     use kernel::interrupt_controller::InterruptController;
-    use kernel::object::{KernelObject, InterruptObject};
+    use kernel::object::{KernelObject, InterruptObject, InterruptCallbacks};
 
     type AtomicUsize = <K as kernel::Arch>::AtomicUsize;
 
-    fn ack_irqs(signal_mask: Signals) {
-        // Depending on the optimizer, it may make sense to investigate
-        // if adding a helper function which takes the signal_mask_table as an
-        // argument reduces code size.
-        let signal_mask_table: [u32; {{ object.irqs | length }}] = [
-        {%- for irq in object.irqs %}
-            {{irq.number}}{% if not loop.last %},{% endif %}
-        {%- endfor %}
-        ];
+    // Signal mask to IRQ number table for this interrupt object.
+    const SIGNAL_MASK_TABLE: [u32; {{ object.irqs | length }}] = [
+    {%- for irq in object.irqs %}
+        {{irq.number}}{% if not loop.last %},{% endif %}
+    {%- endfor %}
+    ];
 
+    fn for_each_irq_in_mask(signal_mask: Signals, mut f: impl FnMut(u32)) {
         // Depending on the number of IRQs an object is handling a find first set
         // loop may be more performant, but the FFS approach has a negative impact
         // on code size, especially on RISC-V without the ZBB extension.
-        for (index, irq) in signal_mask_table.iter().enumerate() {
+        for (index, irq) in SIGNAL_MASK_TABLE.iter().enumerate() {
             // IRQ signals start at bit 16.
             let interrupt_bit = 1 << (16 + index);
             if signal_mask.contains(Signals::from_bits_retain(interrupt_bit)) {
-                <K as kernel::Arch>::InterruptController::userspace_interrupt_ack(*irq);
+                f(*irq);
             }
         }
     }
 
-    // Create the interrupt object.
+    fn ack_irqs(signal_mask: Signals) {
+        for_each_irq_in_mask(signal_mask, |irq| {
+            <K as kernel::Arch>::InterruptController::userspace_interrupt_ack(irq);
+        });
+    }
+
+    fn enable_irqs(signal_mask: Signals) {
+        for_each_irq_in_mask(signal_mask, |irq| {
+            <K as kernel::Arch>::InterruptController::enable_interrupt(irq);
+        });
+    }
+
+    fn disable_irqs(signal_mask: Signals) {
+        for_each_irq_in_mask(signal_mask, |irq| {
+            <K as kernel::Arch>::InterruptController::disable_interrupt(irq);
+        });
+    }
+
+    fn clear_pending_irqs(signal_mask: Signals) {
+        for_each_irq_in_mask(signal_mask, |irq| {
+            <K as kernel::Arch>::InterruptController::clear_interrupt_pending(irq);
+        });
+    }
+
+    fn get_status_irqs(signal_mask: Signals) -> syscall_defs::InterruptStatus {
+        let mut status = syscall_defs::InterruptStatus::new();
+        for_each_irq_in_mask(signal_mask, |irq| {
+            if <K as kernel::Arch>::InterruptController::is_interrupt_enabled(irq) {
+                status |= syscall_defs::InterruptStatus::ENABLED;
+            }
+            if <K as kernel::Arch>::InterruptController::is_interrupt_pending(irq) {
+                status |= syscall_defs::InterruptStatus::PENDING;
+            }
+        });
+        status
+    }
+
+    // Create the interrupt object with full callbacks.
+    let callbacks = InterruptCallbacks {
+        ack_irqs,
+        enable_irqs,
+        disable_irqs,
+        clear_pending_irqs,
+        get_status_irqs,
+    };
     let interrupt =
-        unsafe { static_foreign_rc!(AtomicUsize, InterruptObject<K>, InterruptObject::new(ack_irqs)) };
+        unsafe { static_foreign_rc!(AtomicUsize, InterruptObject<K>, InterruptObject::new(callbacks)) };
 
     unsafe { {{object.object_ref_name}}.set(interrupt.clone()) };
 
     // Enable the interrupts for all interrupts handled by interrupt objects.
+    // Note: Userspace can later disable/re-enable via interrupt_control().
     {%- for irq in object.irqs %}
     <arch::Arch as kernel::Arch>::InterruptController::enable_interrupt({{irq.number}});
     {%- endfor %}
